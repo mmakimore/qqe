@@ -18,7 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 import database as db
-from config import BANKS, MAX_ACTIVE_BOOKINGS, MAX_SPOTS_PER_USER, ABOUT_TEXT, RULES_TEXT, TIME_STEP_MINUTES, WORKING_HOURS_START, WORKING_HOURS_END, MIN_BOOKING_MINUTES, AVAILABILITY_LOOKAHEAD_DAYS, ADMIN_CHECK_USERNAME, CARD_NUMBER, TIMEZONE, FIXED_ADDRESS, PRICE_TOTAL_BY_HOURS
+from config import BANKS, MAX_ACTIVE_BOOKINGS, MAX_SPOTS_PER_USER, ABOUT_TEXT, RULES_TEXT, TIME_STEP_MINUTES, WORKING_HOURS_START, WORKING_HOURS_END, MIN_BOOKING_MINUTES, AVAILABILITY_LOOKAHEAD_DAYS, ADMIN_CHECK_USERNAME, CARD_NUMBER, TIMEZONE, FIXED_ADDRESS, PRICE_TOTAL_BY_HOURS, WELCOME_TEXT
 from keyboards import *
 from utils import *
 
@@ -133,14 +133,29 @@ async def _check_ban(msg_or_cb):
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    # Синхронизируем username из Telegram всегда, чтобы он "притягивался" независимо от телефона.
+    tg_username = message.from_user.username or ""
     user = db.get_user_by_telegram_id(message.from_user.id)
     if user:
+        # Если пользователь поменял username или он был пустым — обновляем.
+        try:
+            if tg_username and tg_username != (user.get('username') or ""):
+                db.update_user(user['id'], username=tg_username)
+                user['username'] = tg_username
+        except Exception:
+            pass
         banned, reason, until = db.is_user_banned(user)
         if banned:
             t = "🚫 Вы заблокированы"
             if until: t += f" до {format_datetime(datetime.fromisoformat(until))}"
             if reason: t += f"\n📝 {reason}"
             await message.answer(t, parse_mode="HTML"); return
+        # Приветствие
+        try:
+            await message.answer(WELCOME_TEXT)
+        except Exception:
+            pass
+
         await message.answer(f"👋 <b>{user['full_name']}</b>, выберите действие:",
             reply_markup=get_main_menu_keyboard(user['role']=='admin'), parse_mode="HTML")
         unreviewed = db.get_completed_unreviewed_bookings(user['id'])
@@ -152,8 +167,11 @@ async def cmd_start(message: Message, state: FSMContext):
                     [InlineKeyboardButton(text="⭐ Оставить отзыв", callback_data=f"review_start_{b['id']}")]
                 ]))
     else:
+        # Запомним username сразу (на случай, если далее будут сообщения без from_user.username)
+        await state.update_data(tg_username=tg_username)
+        await message.answer(WELCOME_TEXT)
         await message.answer(
-            "👋 <b>ParkingBot</b> — аренда парковочных мест\n\n📝 Введите <b>имя и фамилию</b>:",
+            "📝 Введите <b>имя и фамилию</b>:",
             reply_markup=get_cancel_keyboard(), parse_mode="HTML")
         await state.set_state(RegistrationStates.waiting_name)
 
@@ -185,14 +203,17 @@ async def reg_phone(message: Message, state: FSMContext):
         ok, r = validate_phone(message.text)
         if not ok: await message.answer(r); return
     data = await state.get_data()
-    db.create_user(telegram_id=message.from_user.id, username=message.from_user.username or "",
-                   full_name=data['full_name'], phone=r)
+    tg_username = message.from_user.username or data.get('tg_username', "") or ""
+    db.create_user(
+        telegram_id=message.from_user.id,
+        username=tg_username,
+        full_name=data['full_name'],
+        phone=r
+    )
     await state.clear()
     await message.answer(f"✅ <b>Готово!</b>\n\n👤 {data['full_name']}\n📞 {r}",
         reply_markup=get_main_menu_keyboard(), parse_mode="HTML")
-    for a in db.get_admins():
-        try: await message.bot.send_message(a['telegram_id'], f"👤 Новый: {data['full_name']} {r}")
-        except: pass
+    # Уведомления о новых пользователях отключены (по ТЗ).
 
 
 # ==================== NAV ====================
@@ -224,34 +245,16 @@ async def menu_cb(callback: CallbackQuery, state: FSMContext):
 # ==================== О СЕРВИСЕ / ПРАВИЛА ====================
 @router.message(F.text == "📊 Тарифы")
 async def show_tariffs(message: Message):
-    # Таблица тарифов (как в ТЗ)
-    rows = [
-        (1, 100, 100),
-        (2, 200, 100),
-        (3, 300, 100),
-        (4, 380, 95),
-        (5, 450, 90),
-        (6, 510, 85),
-        (7, 560, 80),
-        (8, 600, 75),
-        (10, 750, 75),
-        (11, 825, 75),
-        (12, 900, 75),
-        (13, 975, 75),
-        (14, 1050, 75),
-        (15, 1125, 75),
-        (16, 1200, 75),
-        (17, 1275, 75),
-        (18, 1350, 75),
-        (19, 1425, 75),
-        (20, 1500, 75),
-        (21, 1575, 75),
-        (22, 1650, 75),
-        (23, 1725, 75),
-        (24, 2000, 83),
-    ]
+    # Таблица дневных тарифов (из config.PRICE_TOTAL_BY_HOURS)
+    from config import PRICE_TOTAL_BY_HOURS, NIGHT_TOTAL_BY_HOURS, NIGHT_START, NIGHT_END, NIGHT_MIN_PRICE
+
+    rows = []
+    for h in sorted(PRICE_TOTAL_BY_HOURS.keys()):
+        total = int(PRICE_TOTAL_BY_HOURS[h])
+        per_h = int(round(total / h))
+        rows.append((h, total, per_h))
     lines = []
-    lines.append("📊 <b>Тарифы</b>")
+    lines.append("📊 <b>Тарифы (день)</b>")
     lines.append(f"📍 {FIXED_ADDRESS}")
     lines.append("")
     lines.append("<pre>")
@@ -260,6 +263,19 @@ async def show_tariffs(message: Message):
     for h,total,per_h in rows:
         lines.append(f"| {str(h).ljust(4)} | {str(total).ljust(13)} | {str(per_h).ljust(11)} |")
     lines.append("</pre>")
+
+    # Ночные тарифы
+    lines.append("")
+    lines.append(f"🌙 <b>Ночь</b>: {NIGHT_START}–{NIGHT_END}")
+    lines.append(f"Ночная часть: минимум <b>{NIGHT_MIN_PRICE}₽</b> (можно брать от 1 часа).")
+    lines.append(f"Если бронь заходит в ночь из дня — считается день + ночь; ночная часть всё равно минимум <b>{NIGHT_MIN_PRICE}₽</b>.")
+    lines.append("<pre>")
+    lines.append("| Часы | Итоговая цена |")
+    lines.append("| ---- | ------------- |")
+    for h in sorted(NIGHT_TOTAL_BY_HOURS.keys()):
+        lines.append(f"| {str(h).ljust(4)} | {str(int(NIGHT_TOTAL_BY_HOURS[h])).ljust(13)} |")
+    lines.append("</pre>")
+
     lines.append("По всем вопросам пишите @timofey_zhuravel")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -414,10 +430,10 @@ def _date_range_kb(slot_start, slot_end, prefix):
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def _time_range_kb(start_dt, end_dt, prefix):
+def _time_range_kb(start_dt, end_dt, prefix, include_end: bool = False):
     buttons = []; times = []; t = start_dt.replace(minute=0, second=0)
     if t < start_dt: t += timedelta(hours=1)
-    while t < end_dt:
+    while t < end_dt or (include_end and t == end_dt):
         times.append(t.strftime("%H:%M")); t += timedelta(hours=1)
     if not times and start_dt < end_dt:
         times.append(start_dt.strftime("%H:%M"))
@@ -430,7 +446,10 @@ def _time_range_kb(start_dt, end_dt, prefix):
 
 def _confirm_text(bs, be):
     h = (be - bs).total_seconds() / 3600
-    tp = calculate_price(bs, be)
+    try:
+        tp = calculate_price(bs, be)
+    except ValueError:
+        tp = "—"
     rate = get_price_per_hour(h)
     return (
         f"📋 <b>Подтверждение</b>\n\n"
@@ -463,7 +482,11 @@ async def select_slot(callback: CallbackQuery, state: FSMContext):
     hours = (edt - sdt).total_seconds() / 3600
     avg_r, cnt_r = db.get_spot_rating(slot['spot_id'])
     rating = f" | ⭐ {avg_r}/5 ({cnt_r})" if cnt_r else ""
-    full_price = calculate_price(sdt, edt)
+    try:
+        full_price = calculate_price(sdt, edt)
+    except ValueError:
+        await callback.message.answer("❌ Этот слот нельзя забронировать по тарифам.")
+        return
     rate = get_price_per_hour(hours)
     addr = slot.get('address') or "—"
     await state.update_data(
@@ -484,12 +507,16 @@ async def select_slot(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(header + "📅 <b>Дата начала</b>:",
             reply_markup=_date_range_kb(sdt, edt, "bksd"), parse_mode="HTML")
         await state.set_state(SearchStates.selecting_start_date)
-    elif hours > 2:
+    elif hours > 1:
         await callback.message.edit_text(header + "⏰ <b>Время начала</b>:",
             reply_markup=_time_range_kb(sdt, edt, "bkst"), parse_mode="HTML")
         await state.set_state(SearchStates.selecting_start_time)
     else:
-        tp = calculate_price(sdt, edt)
+        try:
+            tp = calculate_price(sdt, edt)
+        except ValueError:
+            await callback.message.answer("❌ Не удалось рассчитать тариф для выбранного интервала. Попробуйте другое время.")
+            return
         await state.update_data(start_time=sdt, end_time=edt, total_price=tp)
         await callback.message.edit_text(_confirm_text(sdt, edt),
             reply_markup=get_confirm_keyboard("booking_confirm"), parse_mode="HTML")
@@ -503,7 +530,11 @@ async def bk_start_date(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     sdt, edt = data['slot_start'], data['slot_end']
     if val == "full":
-        tp = calculate_price(sdt, edt)
+        try:
+            tp = calculate_price(sdt, edt)
+        except ValueError:
+            await callback.message.answer("❌ Не удалось рассчитать тариф для выбранного интервала. Попробуйте другое время.")
+            return
         await state.update_data(start_time=sdt, end_time=edt, total_price=tp)
         await callback.message.edit_text(_confirm_text(sdt, edt),
             reply_markup=get_confirm_keyboard("booking_confirm"), parse_mode="HTML")
@@ -525,7 +556,11 @@ async def bk_start_time(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     sdt, edt = data['slot_start'], data['slot_end']
     if val == "full":
-        tp = calculate_price(sdt, edt)
+        try:
+            tp = calculate_price(sdt, edt)
+        except ValueError:
+            await callback.message.answer("❌ Не удалось рассчитать тариф для выбранного интервала. Попробуйте другое время.")
+            return
         await state.update_data(start_time=sdt, end_time=edt, total_price=tp)
         await callback.message.edit_text(_confirm_text(sdt, edt),
             reply_markup=get_confirm_keyboard("booking_confirm"), parse_mode="HTML")
@@ -544,7 +579,7 @@ async def bk_start_time(callback: CallbackQuery, state: FSMContext):
         await state.set_state(SearchStates.selecting_end_date)
     else:
         await callback.message.edit_text(f"📅 Начало: <b>{format_datetime(bs)}</b>\n\n⏰ <b>Время окончания</b>:",
-            reply_markup=_time_range_kb(bs + timedelta(hours=1), edt, "bket"), parse_mode="HTML")
+            reply_markup=_time_range_kb(bs + timedelta(hours=1), edt, "bket", include_end=True), parse_mode="HTML")
         await state.set_state(SearchStates.selecting_end_time)
 
 # Booking: End Date
@@ -555,7 +590,11 @@ async def bk_end_date(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     bs = data['booking_start']; edt = data['slot_end']
     if val == "full":
-        tp = calculate_price(bs, edt)
+        try:
+            tp = calculate_price(bs, edt)
+        except ValueError:
+            await callback.message.answer("❌ Не удалось рассчитать тариф для выбранного интервала. Попробуйте другое время.")
+            return
         await state.update_data(start_time=bs, end_time=edt, total_price=tp)
         await callback.message.edit_text(_confirm_text(bs, edt),
             reply_markup=get_confirm_keyboard("booking_confirm"), parse_mode="HTML")
@@ -566,7 +605,7 @@ async def bk_end_date(callback: CallbackQuery, state: FSMContext):
     t_from = bs + timedelta(hours=1) if picked == bs.date() else datetime.combine(picked, datetime.min.time().replace(hour=1))
     t_to = edt if picked == edt.date() else datetime.combine(picked, datetime.max.time().replace(hour=23, minute=0, second=0, microsecond=0))
     await callback.message.edit_text(f"📅 {format_datetime(bs)} — <b>{picked.strftime('%d.%m.%Y')}</b>\n\n⏰ <b>Время окончания</b>:",
-        reply_markup=_time_range_kb(t_from, t_to, "bket"), parse_mode="HTML")
+        reply_markup=_time_range_kb(t_from, t_to, "bket", include_end=True), parse_mode="HTML")
     await state.set_state(SearchStates.selecting_end_time)
 
 # Booking: End Time
@@ -584,7 +623,11 @@ async def bk_end_time(callback: CallbackQuery, state: FSMContext):
             be = datetime.combine(ed, t)
             if be <= bs or be > edt: return
         except: return
-    tp = calculate_price(bs, be)
+    try:
+        tp = calculate_price(bs, be)
+    except ValueError:
+        await callback.message.answer("❌ Не удалось рассчитать тариф для выбранного интервала. Попробуйте другое время.")
+        return
     await state.update_data(start_time=bs, end_time=be, total_price=tp)
     await callback.message.edit_text(_confirm_text(bs, be),
         reply_markup=get_confirm_keyboard("booking_confirm"), parse_mode="HTML")
@@ -611,6 +654,8 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
         msg = str(e).lower()
         if "past" in msg or "прошл" in msg:
             text = "❌ Нельзя бронировать время в прошлом."
+        elif "night booking" in msg or "at least 8" in msg:
+            text = "❌ Не удалось рассчитать тариф для выбранного интервала. Попробуйте другое время."
         elif "outside" in msg or "вне" in msg:
             text = "❌ Вы выбрали время вне доступного слота."
         elif "booked" in msg or "занят" in msg:
