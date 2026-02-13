@@ -59,6 +59,54 @@ class AdminStates(StatesGroup):
     waiting_ban_reason = State()
     waiting_broadcast_message = State()
     waiting_edit_hours = State()
+    waiting_user_search = State()
+
+
+# ==================== USERS LIST (PAGINATION/SEARCH) ====================
+USERS_PAGE_SIZE = 10
+
+def _user_btn_text(u: dict) -> str:
+    icon = "👑" if u.get('role') == 'admin' else "👤"
+    if not u.get('is_active', True):
+        icon = "🚫"
+    name = (u.get('full_name') or "—").strip()
+    uname = (u.get('username') or "").strip()
+    if uname:
+        uname_txt = f"@{uname}"
+    else:
+        # Чтобы "юзернейм" был всегда хоть какой-то идентификацией
+        uname_txt = f"id:{u.get('telegram_id','')}"
+    txt = f"{icon} {name} · {uname_txt}"
+    # Telegram ограничивает длину текста кнопки
+    if len(txt) > 64:
+        txt = txt[:61] + "…"
+    return txt
+
+def _users_keyboard(users: list[dict], page: int, pages: int, nav_prefix: str, show_search: bool = True) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    for u in users:
+        buttons.append([InlineKeyboardButton(text=_user_btn_text(u), callback_data=f"adm_user_{u['id']}")])
+
+    # Навигация
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"{nav_prefix}_{page-1}"))
+    else:
+        nav_row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
+    nav_row.append(InlineKeyboardButton(text=f"{page+1}/{max(pages,1)}", callback_data="noop"))
+    if page + 1 < pages:
+        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"{nav_prefix}_{page+1}"))
+    else:
+        nav_row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
+    buttons.append(nav_row)
+
+    if show_search:
+        buttons.append([InlineKeyboardButton(text="🔎 Поиск", callback_data="admin_users_search")])
+    else:
+        buttons.append([InlineKeyboardButton(text="❌ Сброс поиска", callback_data="admin_users")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 Панель", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 class AdminSlotEditStates(StatesGroup):
@@ -577,16 +625,143 @@ async def admin_slot_edit_time(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "admin_users")
 async def admin_users(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    users = db.get_all_users(limit=30)
-    buttons = []
-    for u in users:
-        icon = "👑" if u['role']=='admin' else "👤"
-        if not u['is_active']: icon = "🚫"
-        buttons.append([InlineKeyboardButton(text=f"{icon} {u['full_name']}",
-            callback_data=f"adm_user_{u['id']}")])
-    buttons.append([InlineKeyboardButton(text="🔙 Панель", callback_data="admin_panel")])
-    await callback.message.edit_text("👥 <b>Пользователи:</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    # Сбросим поиск
+    try:
+        await state.update_data(user_search_query=None)
+    except Exception:
+        pass
+    await _show_users_page(callback, state, page=0, mode="all")
+
+
+async def _show_users_page(callback: CallbackQuery, state: FSMContext, page: int, mode: str = "all"):
+    page = max(0, int(page))
+    if mode == "search":
+        data = await state.get_data()
+        q = (data.get('user_search_query') or "").strip()
+        if not q:
+            await callback.message.edit_text(
+                "🔎 Введите поисковый запрос через кнопку «Поиск».",
+                reply_markup=_users_keyboard([], 0, 1, "admin_users_page", show_search=True),
+            )
+            return
+        total = db.search_users_count(q)
+        pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
+        page = min(page, pages - 1)
+        users = db.search_users(q, limit=USERS_PAGE_SIZE, offset=page * USERS_PAGE_SIZE)
+        text = f"👥 <b>Пользователи</b>\n🔎 <b>Поиск:</b> {q}\nВсего: {total}"
+        kb = _users_keyboard(users, page, pages, "admin_users_search_page", show_search=False)
+    else:
+        total = db.get_users_count()
+        pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
+        page = min(page, pages - 1)
+        users = db.get_all_users(limit=USERS_PAGE_SIZE, offset=page * USERS_PAGE_SIZE)
+        text = f"👥 <b>Пользователи ({total})</b>"
+        kb = _users_keyboard(users, page, pages, "admin_users_page", show_search=True)
+
+    if not users:
+        if mode == "search":
+            text += "\n\n😕 Ничего не найдено."
+        else:
+            text += "\n\n😕 Список пуст."
+
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("admin_users_page_"))
+async def admin_users_page(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    page = int(callback.data.replace("admin_users_page_", "") or 0)
+    await _show_users_page(callback, state, page=page, mode="all")
+
+
+@router.callback_query(F.data.startswith("admin_users_search_page_"))
+async def admin_users_search_page(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    page = int(callback.data.replace("admin_users_search_page_", "") or 0)
+    await _show_users_page(callback, state, page=page, mode="search")
+
+
+@router.callback_query(F.data == "admin_users_search")
+async def admin_users_search(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.update_data(
+        user_search_origin_chat_id=callback.message.chat.id,
+        user_search_origin_msg_id=callback.message.message_id,
+    )
+    await callback.message.edit_text(
+        "🔎 <b>Поиск пользователя</b>\n\n"
+        "Введите имя / телефон / @username / telegram_id:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_users")],
+        ]),
+        parse_mode="HTML",
+    )
+    await state.set_state(AdminStates.waiting_user_search)
+
+
+@router.message(AdminStates.waiting_user_search)
+async def admin_users_search_query(message: Message, state: FSMContext):
+    q = (message.text or "").strip()
+    if not q or q.lower() in ("отмена", "cancel"):
+        data = await state.get_data()
+        chat_id = data.get('user_search_origin_chat_id')
+        msg_id = data.get('user_search_origin_msg_id')
+        await state.set_state(None)
+
+        total = db.get_users_count()
+        pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
+        users = db.get_all_users(limit=USERS_PAGE_SIZE, offset=0)
+        text = f"👥 <b>Пользователи ({total})</b>"
+        kb = _users_keyboard(users, 0, pages, "admin_users_page", show_search=True)
+
+        try:
+            if chat_id and msg_id:
+                await message.bot.edit_message_text(
+                    text,
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+            else:
+                await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            await message.answer(text, reply_markup=kb, parse_mode="HTML")
+        return
+
+    data = await state.get_data()
+    chat_id = data.get('user_search_origin_chat_id')
+    msg_id = data.get('user_search_origin_msg_id')
+
+    await state.update_data(user_search_query=q)
+    await state.set_state(None)
+
+    total = db.search_users_count(q)
+    users = db.search_users(q, limit=USERS_PAGE_SIZE, offset=0)
+    pages = max(1, (total + USERS_PAGE_SIZE - 1) // USERS_PAGE_SIZE)
+    text = f"👥 <b>Пользователи</b>\n🔎 <b>Поиск:</b> {q}\nВсего: {total}"
+    kb = _users_keyboard(users, 0, pages, "admin_users_search_page", show_search=False)
+    if not users:
+        text += "\n\n😕 Ничего не найдено."
+
+    try:
+        if chat_id and msg_id:
+            await message.bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=msg_id,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(F.data == "noop")
+async def noop_callback(callback: CallbackQuery):
+    await callback.answer()
 
 @router.callback_query(F.data.startswith("adm_user_"))
 async def admin_user_detail(callback: CallbackQuery, state: FSMContext):
@@ -604,8 +779,14 @@ async def admin_user_detail(callback: CallbackQuery, state: FSMContext):
             ban = f"\n🚫 Бан до {format_datetime(user['banned_until'])}"
         else: ban = "\n🚫 Перманентный бан"
         if user.get('ban_reason'): ban += f" ({user['ban_reason']})"
-    text = (f"👤 <b>{user['full_name']}</b>\n📞 {user['phone']}"
-            f"\n📱 @{user.get('username','—')}{card}{car}{ban}")
+    uname = (user.get('username') or "").strip()
+    uname_line = f"@{uname}" if uname else "—"
+    profile_link = f"<a href=\"tg://user?id={user['telegram_id']}\">открыть профиль</a>"
+    text = (
+        f"👤 <b>{user['full_name']}</b>\n"
+        f"📞 {user['phone']}\n"
+        f"📱 {uname_line} · {profile_link}{card}{car}{ban}"
+    )
     await callback.message.edit_text(text,
         reply_markup=get_user_admin_actions_keyboard(uid, user), parse_mode="HTML")
 
