@@ -171,7 +171,7 @@ def create_user(telegram_id, username, full_name, phone, card_number='', bank=''
         return uid
 
 def update_user(user_id, **kw):
-    ok = ['full_name','phone','card_number','bank','role','is_active','balance',
+    ok = ['username','full_name','phone','card_number','bank','role','is_active','balance',
           'license_plate','car_brand','car_color','banned_until','ban_reason']
     u = {k:v for k,v in kw.items() if k in ok}
     if not u: return False
@@ -214,6 +214,48 @@ def get_active_users():
         return [dict(r) for r in conn.cursor().execute('SELECT * FROM users WHERE is_active=1').fetchall()]
 def get_users_count():
     with get_connection() as conn: return conn.cursor().execute('SELECT COUNT(*) FROM users').fetchone()[0]
+
+def search_users(query: str, limit: int = 50, offset: int = 0):
+    """Поиск пользователей по имени, телефону, username или telegram_id."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    like = f"%{q}%"
+    with get_connection() as conn:
+        cur = conn.cursor()
+        rows = cur.execute(
+            """
+            SELECT * FROM users
+            WHERE full_name LIKE ?
+               OR phone LIKE ?
+               OR username LIKE ?
+               OR CAST(telegram_id AS TEXT) LIKE ?
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (like, like, like, like, limit, offset),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+def search_users_count(query: str) -> int:
+    q = (query or "").strip()
+    if not q:
+        return 0
+    like = f"%{q}%"
+    with get_connection() as conn:
+        cur = conn.cursor()
+        return int(
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM users
+                WHERE full_name LIKE ?
+                   OR phone LIKE ?
+                   OR username LIKE ?
+                   OR CAST(telegram_id AS TEXT) LIKE ?
+                """,
+                (like, like, like, like),
+            ).fetchone()[0]
+        )
 def get_admins():
     with get_connection() as conn: return [dict(r) for r in conn.cursor().execute("SELECT * FROM users WHERE role='admin'").fetchall()]
 def set_user_role(uid, role): return update_user(uid, role=role)
@@ -614,7 +656,10 @@ def admin_edit_booking_hours(bid, paid_hours):
         full_hours = int(((book_end - book_start).total_seconds() + 3600 - 1) // 3600)
         if paid_hours >= full_hours:
             # оплачен весь интервал — просто пересчитываем цену на всякий случай
-            new_price = calculate_price(book_start, book_end)
+            try:
+                new_price = calculate_price(book_start, book_end)
+            except ValueError:
+                return False
             c.execute("UPDATE bookings SET total_price=? WHERE id=?", (new_price, bid))
             try:
                 normalize_booking_availability(bid)
@@ -650,7 +695,10 @@ def admin_edit_booking_hours(bid, paid_hours):
             'UPDATE spot_availability SET end_time=? WHERE id=? AND booking_id=?',
             (new_end.strftime("%Y-%m-%d %H:%M:%S"), aid, bid)
         )
-        new_price = calculate_price(book_start, new_end)
+        try:
+            new_price = calculate_price(book_start, new_end)
+        except ValueError:
+            return False
         c.execute(
             'UPDATE bookings SET end_time=?, total_price=? WHERE id=?',
             (new_end.strftime("%Y-%m-%d %H:%M:%S"), new_price, bid)
