@@ -22,6 +22,7 @@ import os
 
 # Создаём директорию для БД если нет
 os.makedirs(os.path.dirname(DATABASE_PATH) or '.', exist_ok=True)
+from nav_handlers import router as nav_router
 from user_handlers import router as user_router
 from admin_handlers import router as admin_router
 from fallback_handlers import router as fallback_router
@@ -249,6 +250,7 @@ async def main():
     # Регистрируем роутеры
     # Важно: fallback_router ДОЛЖЕН быть последним, иначе он перехватит чужие callback'и.
     dp.include_router(admin_router)
+    dp.include_router(nav_router)
     dp.include_router(user_router)
     dp.include_router(fallback_router)
     
