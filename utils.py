@@ -146,33 +146,117 @@ def _hours_ceil(start: datetime, end: datetime) -> int:
     return int((seconds + 3600 - 1) // 3600)
 
 def calculate_price(start, end):
-    """Считает итоговую цену по таблице 'итог за N часов' (как в ТЗ).
+    """Считает итоговую цену.
 
-    Минуты (если внезапно появились) округляются вверх до часа.
+    Правила:
+    - Днём действует таблица PRICE_TOTAL_BY_HOURS (итог за N часов).
+    - Ночью (20:00–08:00) действует отдельный тариф:
+        • 10ч → 600₽, 11ч → 650₽, 12ч → 700₽
+        • минимальная стоимость ночного тарифа — 600₽
+        • ночной тариф можно брать от 1 часа, но ночная часть всегда минимум 600₽
+    - Если бронь затрагивает и день, и ночь — стоимость = (день) + (ночь).
+
+    Минуты округляются вверх до часа (как и раньше).
     """
     if isinstance(start, str):
         start = datetime.fromisoformat(start)
     if isinstance(end, str):
         end = datetime.fromisoformat(end)
 
-    hours = _hours_ceil(start, end)
-    if hours <= 0:
+    if end <= start:
         return 0
 
-    from config import PRICE_TOTAL_BY_HOURS, EXTRA_HOUR_PRICE_AFTER_24
+    from config import (
+        PRICE_TOTAL_BY_HOURS, EXTRA_HOUR_PRICE_AFTER_24,
+        NIGHT_START, NIGHT_END, NIGHT_MIN_PRICE, NIGHT_TOTAL_BY_HOURS,
+    )
 
-    if hours in PRICE_TOTAL_BY_HOURS:
-        return int(PRICE_TOTAL_BY_HOURS[hours])
+    def _day_price(h: int) -> int:
+        h = int(max(0, h))
+        if h <= 0:
+            return 0
+        if h in PRICE_TOTAL_BY_HOURS:
+            return int(PRICE_TOTAL_BY_HOURS[h])
+        days = h // 24
+        rem = h % 24
+        total = days * int(PRICE_TOTAL_BY_HOURS[24])
+        if rem:
+            if rem in PRICE_TOTAL_BY_HOURS:
+                total += int(PRICE_TOTAL_BY_HOURS[rem])
+            else:
+                total += rem * int(EXTRA_HOUR_PRICE_AFTER_24)
+        return int(total)
 
-    # >24ч: 2000₽ за каждые 24ч + 75₽ за каждый дополнительный час
-    days = hours // 24
-    rem = hours % 24
-    total = days * int(PRICE_TOTAL_BY_HOURS[24])
-    if rem:
-        if rem in PRICE_TOTAL_BY_HOURS:
-            total += int(PRICE_TOTAL_BY_HOURS[rem])
+    def _night_price(h: int) -> int:
+        """Цена за h ночных часов (минимум NIGHT_MIN_PRICE)."""
+        h = int(max(0, h))
+        if h <= 0:
+            return 0
+        # В ТЗ явно указаны 10/11/12, ниже 10 — минималка.
+        if h <= 10:
+            return int(NIGHT_MIN_PRICE)
+        if h in NIGHT_TOTAL_BY_HOURS:
+            return int(NIGHT_TOTAL_BY_HOURS[h])
+        # 12+ считаем как максимум ночи
+        return int(NIGHT_TOTAL_BY_HOURS.get(12, NIGHT_MIN_PRICE))
+
+    # --- Разбиваем интервал по границам 08:00/20:00, чтобы корректно отделить день/ночь.
+    def _parse_hm(s: str):
+        hh, mm = map(int, s.split(":"))
+        return hh, mm
+
+    ns_h, ns_m = _parse_hm(NIGHT_START)
+    ne_h, ne_m = _parse_hm(NIGHT_END)
+
+    # Границы тарифов (день = [NIGHT_END, NIGHT_START), ночь = остальное)
+    # Для аккуратного разбиения собираем все точки переключения в (start, end)
+    boundaries = []
+    start_date = start.date()
+    end_date = end.date()
+    d = start_date
+    while d <= end_date:
+        b1 = datetime(d.year, d.month, d.day, ne_h, ne_m)  # 08:00
+        b2 = datetime(d.year, d.month, d.day, ns_h, ns_m)  # 20:00
+        if start < b1 < end:
+            boundaries.append(b1)
+        if start < b2 < end:
+            boundaries.append(b2)
+        d += timedelta(days=1)
+
+    boundaries.sort()
+    points = [start] + boundaries + [end]
+
+    day_hours = 0
+    night_segments_hours: list[int] = []
+
+    def _is_night(dt: datetime) -> bool:
+        t = dt.time()
+        # ночь: [20:00..24:00) или [00:00..08:00)
+        return (t.hour, t.minute) >= (ns_h, ns_m) or (t.hour, t.minute) < (ne_h, ne_m)
+
+    for a, b in zip(points, points[1:]):
+        if b <= a:
+            continue
+        h = _hours_ceil(a, b)
+        if h <= 0:
+            continue
+        if _is_night(a):
+            night_segments_hours.append(h)
         else:
-            total += rem * int(EXTRA_HOUR_PRICE_AFTER_24)
+            day_hours += h
+
+    total_night_hours = sum(night_segments_hours)
+    mixed = day_hours > 0 and total_night_hours > 0
+
+    total = _day_price(day_hours)
+    # Ночь считаем по каждому сегменту (если бронь затрагивает два разных ночных окна в длинных бронях).
+    for h in night_segments_hours:
+        p = _night_price(h)
+        # В смешанной брони — минималка ночи действует всегда (даже если h=1)
+        if mixed:
+            p = max(int(NIGHT_MIN_PRICE), p)
+        total += p
+
     return int(total)
 
 def format_price_info():
